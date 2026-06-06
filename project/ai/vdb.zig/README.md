@@ -39,6 +39,9 @@ zig build run -- benchmark
 ```bash
 zig build run-server
 # 服务监听 http://0.0.0.0:8080
+
+# 开启详细调试日志
+VDB_DEBUG=1 zig build run-server
 ```
 
 浏览器访问 `http://localhost:8080` 可打开交互式测试页面（灵感来自 llama.cpp 的 `llama-server` 默认页面），提供：
@@ -47,6 +50,8 @@ zig build run-server
 - **性能测试**：配置维度/向量数/nprobe/搜索路径，运行 benchmark 并展示 QPS+Recall 图表
 - **对比分析**：vdb.zig vs Milvus vs LanceDB 性能对比
 - **数据管理**：索引状态、向量导入、召回率测试
+
+服务器使用 POSIX socket 直接系统调用（参考 tsdb.zig），静态资源通过 `@embedFile` 编译时嵌入，无运行时文件依赖。默认输出请求日志（方法+路径+状态码+耗时），`VDB_DEBUG=1` 开启详细调试。
 
 ### 运行 NNG 高性能服务器
 
@@ -74,7 +79,7 @@ NNG 服务器采用轻量级二进制协议：
 - **`src/simd.zig`** — 平台 SIMD 抽象层（x86 AVX-512/AVX2、aarch64 NEON），用于 popcount、点积、L2 距离、批量 XOR-popcount、批量点积、SQ8 反量化（动态范围支持）
 - **`src/gpu.zig`** — GPU 回退策略：**Metal**（macOS，dlopen + kernel 源码）、**CUDA**（Linux，dlopen + kernel 源码）、**OpenCL**（通用，完整 context/queue 创建 + kernel 源码）、**cuVS**（RAPIDS，dlopen 骨架），无 GPU 时自动回落 CPU SIMD
 - **`src/storage.zig`** — 磁盘列式存储（LanceDB 方向）：partition-oriented columnar 格式，支持完整索引 save/load（config、rotation、partitions、super_partitions、next_id），使用 `std.Io` 随机读写 API
-- **`src/server.zig`** — 兼容 OpenAI/Anthropic 的 HTTP API、循环读取完整请求（支持 TCP 分片）、Mutex 并发保护（defer 释放防死锁）、k 值上限保护（<=256）、批量导入、静态文件服务、**benchmark API**、**recall 测试 API**、**索引状态 API**
+- **`src/server.zig`** — 兼容 OpenAI/Anthropic 的 HTTP API、POSIX socket 直接系统调用（参考 tsdb.zig）、`@embedFile` 编译时嵌入静态资源、CORS 跨域支持、请求日志（默认开启，`VDB_DEBUG=1` 详细调试）、Mutex 并发保护（defer 释放防死锁）、k 值上限保护（<=256）、批量导入、**benchmark API**、**recall 测试 API**、**索引状态 API**
 - **`src/nng_server.zig`** — 高性能二进制协议 TCP 服务器、RwLock 并发保护、msg_len==0 DoS 防护、批量导入
 - **`src/cli.zig`** — 嵌入式模式命令行工具
 - **`src/benchmark.zig`** — 与 LanceDB & FAISS 的性能对比基准（纳秒级单调时钟）
@@ -223,8 +228,10 @@ GitHub Actions 工作流（`.github/workflows/ci.yml`）提供：
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/` | 默认 Web 测试页 |
-| GET | `/readme` | README.md |
+| GET | `/` | 默认 Web 测试页（编译时嵌入） |
+| GET | `/app.js` | Web 应用 JS（编译时嵌入） |
+| GET | `/style.css` | Web 样式（编译时嵌入） |
+| OPTIONS | `*` | CORS 预检请求（204 No Content） |
 | GET | `/health` | 健康检查 |
 | POST | `/v1/search` | 单向量搜索（k <= 256） |
 | POST | `/v1/batch_search` | 批量向量搜索（k <= 256） |

@@ -1,5 +1,20 @@
 # 变更日志
 
+## [0.3.1] - 2026-06-07
+
+### Web 服务器重写（参考 tsdb.zig）
+
+- **POSIX socket 替代 std.Io.net**：使用 `c.socket/bind/listen/accept/recv/send` 直接系统调用，彻底解决 `std.Io` writer buffer 限制导致大文件（>4KB）无法发送的问题。
+- **`@embedFile` 编译时嵌入静态资源**：`INDEX_HTML`、`APP_JS`、`STYLE_CSS` 在编译时嵌入二进制，无运行时文件系统依赖，避免文件缺失导致 404。
+- **CORS 跨域支持**：所有响应头添加 `Access-Control-Allow-Origin: *`，新增 `OPTIONS` 预检请求处理（204 No Content）。
+- **请求日志**：默认输出 `info(http): GET / 200 112us` 格式日志（方法+路径+状态码+耗时）；`VDB_DEBUG=1` 环境变量开启详细调试日志（完整请求头）。
+- **1MB 请求缓冲区**：与 tsdb.zig 一致，支持大批量向量导入。
+
+### 修复
+
+- **Web 服务无响应**：`std.Io.net.Stream.Writer` 默认 4KB buffer 无法发送 20KB 的 index.html，改用 POSIX `c.send` 直接发送解决。
+- **路由匹配失败**：浏览器请求 `GET /app.js HTTP/1.1` 末尾无空格，移除路由匹配中的尾部空格。
+
 ## [0.3.0] - 2026-06-06
 
 ### 性能优化
