@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build-and-test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        zig-version: [0.13.0]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ matrix.zig-version }}
+
+      - name: Build all targets
+        run: zig build --summary all
+
+      - name: Run unit tests
+        run: zig build test-unit --summary all
+
+      - name: Run integration tests
+        run: zig build test-integration --summary all
+
+      - name: Run smoke tests
+        run: zig build test-smoke --summary all
+
+      - name: Run regression tests
+        run: zig build test-regression --summary all
+
+      - name: Run acceptance tests
+        run: zig build test-acceptance --summary all
+
+      - name: Run system tests
+        run: zig build test-system --summary all
+
+      - name: Run end-to-end tests
+        run: zig build test-e2e --summary all
+
+      - name: Run full test suite
+        run: zig build test --summary all
+
+      - name: Run benchmarks
+        run: zig build benchmark --summary all
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vdb-${{ matrix.os }}
+          path: |
+            zig-out/bin/vdb-cli
+            zig-out/bin/vdb-server
+            zig-out/bin/vdb-nng-server
+            zig-out/bin/vdb-benchmark
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
+      - name: Zig fmt check
+        run: zig fmt --check .
+
+  deploy-docs:
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    needs: [build-and-test, lint]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate docs placeholder
+        run: echo "Docs deployment step" > docs_placeholder.txt
+      - name: Upload docs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs
+          path: docs_placeholder.txt

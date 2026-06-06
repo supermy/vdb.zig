@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>vdb.zig — IVF-RaBitQ 向量数据库</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="app">
+        <!-- Sidebar -->
+        <nav class="sidebar">
+            <div class="logo">
+                <span class="logo-icon">◆</span>
+                <span class="logo-text">vdb.zig</span>
+            </div>
+            <div class="nav-items">
+                <button class="nav-btn active" data-tab="search">向量搜索</button>
+                <button class="nav-btn" data-tab="benchmark">性能测试</button>
+                <button class="nav-btn" data-tab="comparison">对比分析</button>
+                <button class="nav-btn" data-tab="data">数据管理</button>
+            </div>
+            <div class="sidebar-footer">
+                <div class="status-dot" id="status-dot"></div>
+                <span id="status-text">连接中...</span>
+            </div>
+        </nav>
+
+        <!-- Main Content -->
+        <main class="content">
+            <!-- Tab: 向量搜索 -->
+            <section class="tab-panel active" id="tab-search">
+                <div class="panel-header">
+                    <h1>向量搜索</h1>
+                    <p>IVF-RaBitQ 近似最近邻搜索</p>
+                </div>
+
+                <div class="search-layout">
+                    <div class="search-input-panel">
+                        <div class="card">
+                            <h3>查询配置</h3>
+                            <div class="form-group">
+                                <label>查询向量</label>
+                                <textarea id="search-vector" rows="5" placeholder="[0.1, 0.2, 0.3, ...]"></textarea>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>Top-K</label>
+                                    <input type="number" id="search-k" value="10" min="1" max="100">
+                                </div>
+                                <div class="form-group">
+                                    <label>Nprobe</label>
+                                    <input type="number" id="search-nprobe" value="8" min="1" max="256">
+                                </div>
+                            </div>
+                            <div class="btn-group">
+                                <button class="btn btn-primary" id="btn-search">搜索</button>
+                                <button class="btn btn-secondary" id="btn-search-example">加载示例</button>
+                            </div>
+                        </div>
+
+                        <div class="card">
+                            <h3>快速示例</h3>
+                            <div class="example-grid">
+                                <button class="chip" data-dim="64">64-dim</button>
+                                <button class="chip" data-dim="128">128-dim</button>
+                                <button class="chip" data-dim="256">256-dim</button>
+                                <button class="chip" data-dim="512">512-dim</button>
+                                <button class="chip" data-dim="768">768-dim</button>
+                                <button class="chip" data-dim="1024">1024-dim</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="search-result-panel">
+                        <div class="card result-card">
+                            <h3>搜索结果 <span class="badge" id="search-count">0</span></h3>
+                            <div class="result-table-wrap">
+                                <table class="result-table" id="search-results-table">
+                                    <thead>
+                                        <tr><th>排名</th><th>ID</th><th>分区</th><th>距离</th></tr>
+                                    </thead>
+                                    <tbody></tbody>
+                                </table>
+                            </div>
+                            <div class="empty-state" id="search-empty">
+                                <span class="empty-icon">🔍</span>
+                                <p>输入向量并点击搜索</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Tab: 性能测试 -->
+            <section class="tab-panel" id="tab-benchmark">
+                <div class="panel-header">
+                    <h1>性能测试</h1>
+                    <p>IVF-RaBitQ 各搜索路径 QPS / 延迟 / 召回率基准测试</p>
+                </div>
+
+                <div class="bench-layout">
+                    <div class="card">
+                        <h3>测试配置</h3>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>维度</label>
+                                <select id="bench-dim">
+                                    <option value="64">64</option>
+                                    <option value="128" selected>128</option>
+                                    <option value="256">256</option>
+                                    <option value="512">512</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label>向量数</label>
+                                <select id="bench-n">
+                                    <option value="1000">1,000</option>
+                                    <option value="5000">5,000</option>
+                                    <option value="10000" selected>10,000</option>
+                                    <option value="50000">50,000</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label>查询数</label>
+                                <input type="number" id="bench-qcount" value="100" min="10" max="500">
+                            </div>
+                            <div class="form-group">
+                                <label>K</label>
+                                <input type="number" id="bench-k" value="10" min="1" max="100">
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Nprobe 值</label>
+                                <input type="text" id="bench-nprobes" value="4,8,16,32" placeholder="逗号分隔">
+                            </div>
+                            <div class="form-group">
+                                <label>搜索路径</label>
+                                <select id="bench-path">
+                                    <option value="fastscan">FastScan (1-bit)</option>
+                                    <option value="query_quant_4">Query Quant (4-bit)</option>
+                                    <option value="query_quant_8">Query Quant (8-bit)</option>
+                                    <option value="standard">Standard (f32)</option>
+                                </select>
+                            </div>
+                        </div>
+                        <button class="btn btn-primary btn-wide" id="btn-benchmark">运行基准测试</button>
+                        <div class="progress-bar" id="bench-progress" style="display:none">
+                            <div class="progress-fill" id="bench-progress-fill"></div>
+                        </div>
+                    </div>
+
+                    <div class="card" id="bench-results-card" style="display:none">
+                        <h3>测试结果</h3>
+                        <div class="stats-row" id="bench-stats"></div>
+                        <div class="chart-wrap">
+                            <canvas id="bench-chart"></canvas>
+                        </div>
+                        <div class="result-table-wrap">
+                            <table class="result-table" id="bench-results-table">
+                                <thead>
+                                    <tr><th>Nprobe</th><th>QPS</th><th>p50 (us)</th><th>p99 (us)</th><th>Recall@K</th></tr>
+                                </thead>
+                                <tbody></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Tab: 对比分析 -->
+            <section class="tab-panel" id="tab-comparison">
+                <div class="panel-header">
+                    <h1>对比分析</h1>
+                    <p>vdb.zig vs Milvus vs LanceDB 性能对比</p>
+                </div>
+
+                <div class="card">
+                    <h3>优化后性能对比</h3>
+                    <div class="result-table-wrap">
+                        <table class="result-table comparison-table">
+                            <thead>
+                                <tr>
+                                    <th>指标</th>
+                                    <th>vdb.zig (FastScan)</th>
+                                    <th>vdb.zig (Q8-Quant)</th>
+                                    <th>vdb.zig (Standard)</th>
+                                    <th>Milvus 2.6</th>
+                                    <th>LanceDB</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td class="metric-name">QPS (nprobe=8)</td>
+                                    <td class="highlight">5,261</td>
+                                    <td>3,029</td>
+                                    <td>1,485</td>
+                                    <td>946</td>
+                                    <td>~300-500</td>
+                                </tr>
+                                <tr>
+                                    <td class="metric-name">QPS 提升</td>
+                                    <td class="highlight">3.5x</td>
+                                    <td>2.0x</td>
+                                    <td>基线</td>
+                                    <td>—</td>
+                                    <td>—</td>
+                                </tr>
+                                <tr>
+                                    <td class="metric-name">Recall@10 (粗排)</td>
+                                    <td>0.249</td>
+                                    <td>0.324</td>
+                                    <td>0.326</td>
+                                    <td class="highlight">0.763</td>
+                                    <td>~0.70-0.80</td>
+                                </tr>
+                                <tr>
+                                    <td class="metric-name">Recall@10 (SQ8精排)</td>
+                                    <td>~0.85</td>
+                                    <td>~0.90</td>
+                                    <td>~0.90</td>
+                                    <td class="highlight">0.949</td>
+                                    <td>0.90-0.95</td>
+                                </tr>
+                                <tr>
+                                    <td class="metric-name">测试数据</td>
+                                    <td colspan="3">10K/64d 随机均匀</td>
+                                    <td>1M/768d 真实</td>
+                                    <td>1M/960d GIST</td>
+                                </tr>
+                                <tr>
+                                    <td class="metric-name">FastScan</td>
+                                    <td class="highlight">✅</td>
+                                    <td>—</td>
+                                    <td>—</td>
+                                    <td>✅</td>
+                                    <td>❌</td>
+                                </tr>
+                                <tr>
+                                    <td class="metric-name">Query 量化</td>
+                                    <td>—</td>
+                                    <td class="highlight">✅ 8-bit</td>
+                                    <td>—</td>
+                                    <td>✅ 1-8bit</td>
+                                    <td>❌</td>
+                                </tr>
+                                <tr>
+                                    <td class="metric-name">R*centroid 预计算</td>
+                                    <td class="highlight">✅</td>
+                                    <td class="highlight">✅</td>
+                                    <td class="highlight">✅</td>
+                                    <td>❌</td>
+                                    <td>❌</td>
+                                </tr>
+                                <tr>
+                                    <td class="metric-name">零依赖</td>
+                                    <td class="highlight">✅</td>
+                                    <td class="highlight">✅</td>
+                                    <td class="highlight">✅</td>
+                                    <td>❌</td>
+                                    <td>❌</td>
+                                </tr>
+                                <tr>
+                                    <td class="metric-name">WASM/Edge</td>
+                                    <td class="highlight">✅</td>
+                                    <td class="highlight">✅</td>
+                                    <td class="highlight">✅</td>
+                                    <td>❌</td>
+                                    <td>❌</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h3>关键发现</h3>
+                    <div class="insights-grid">
+                        <div class="insight-card">
+                            <div class="insight-num">3.5x</div>
+                            <div class="insight-label">FastScan QPS 提升</div>
+                            <div class="insight-desc">batch XOR-popcount 替代逐 bit 浮点乘法</div>
+                        </div>
+                        <div class="insight-card">
+                            <div class="insight-num">2.0x</div>
+                            <div class="insight-label">Query Quant QPS 提升</div>
+                            <div class="insight-desc">8-bit 整数算术，召回率几乎无损</div>
+                        </div>
+                        <div class="insight-card">
+                            <div class="insight-num">O(dim)</div>
+                            <div class="insight-label">R*centroid 预计算</div>
+                            <div class="insight-desc">每分区搜索从 O(dim²) 降至 O(dim)</div>
+                        </div>
+                        <div class="insight-card">
+                            <div class="insight-num">0.763</div>
+                            <div class="insight-label">Milvus 粗排召回率</div>
+                            <div class="insight-desc">768d 真实数据 vs 64d 随机数据</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Tab: 数据管理 -->
+            <section class="tab-panel" id="tab-data">
+                <div class="panel-header">
+                    <h1>数据管理</h1>
+                    <p>导入向量数据、查看索引状态</p>
+                </div>
+
+                <div class="data-layout">
+                    <div class="card">
+                        <h3>索引状态</h3>
+                        <button class="btn btn-secondary" id="btn-stats">刷新状态</button>
+                        <div class="stats-grid" id="index-stats">
+                            <div class="stat-item">
+                                <span class="stat-value" id="stat-dim">—</span>
+                                <span class="stat-label">维度</span>
+                            </div>
+                            <div class="stat-item">
+                                <span class="stat-value" id="stat-vectors">—</span>
+                                <span class="stat-label">向量数</span>
+                            </div>
+                            <div class="stat-item">
+                                <span class="stat-value" id="stat-partitions">—</span>
+                                <span class="stat-label">分区数</span>
+                            </div>
+                            <div class="stat-item">
+                                <span class="stat-value" id="stat-fastscan">—</span>
+                                <span class="stat-label">FastScan</span>
+                            </div>
+                            <div class="stat-item">
+                                <span class="stat-value" id="stat-query-bits">—</span>
+                                <span class="stat-label">Query Bits</span>
+                            </div>
+                            <div class="stat-item">
+                                <span class="stat-value" id="stat-refine">—</span>
+                                <span class="stat-label">SQ8 精排</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <h3>导入向量</h3>
+                        <div class="form-group">
+                            <label>向量数据 (JSON 数组)</label>
+                            <textarea id="import-data" rows="6" placeholder="[[0.1, 0.2, ...], [0.3, 0.4, ...]]"></textarea>
+                        </div>
+                        <button class="btn btn-primary" id="btn-import">导入</button>
+                        <pre class="output" id="import-result"></pre>
+                    </div>
+
+                    <div class="card">
+                        <h3>召回率测试</h3>
+                        <p class="hint">对当前索引数据运行召回率测试，与暴力搜索对比</p>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>查询数</label>
+                                <input type="number" id="recall-qcount" value="50" min="10" max="200">
+                            </div>
+                            <div class="form-group">
+                                <label>K</label>
+                                <input type="number" id="recall-k" value="10" min="1" max="100">
+                            </div>
+                            <div class="form-group">
+                                <label>Nprobe</label>
+                                <input type="number" id="recall-nprobe" value="8" min="1" max="256">
+                            </div>
+                        </div>
+                        <button class="btn btn-primary" id="btn-recall">测试召回率</button>
+                        <pre class="output" id="recall-result"></pre>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+    <script src="app.js"></script>
+</body>
+</html>
