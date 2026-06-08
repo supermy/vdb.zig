@@ -37,17 +37,34 @@ pub const Schema = struct {
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, columns: []const ColumnSchema) !Schema {
-        // Validate: vector columns must have dimension % 8 == 0
+        // Validate: vector columns must have dimension % 64 == 0
         for (columns) |col| {
-            if (col.col_type == .vector and col.dimension % 8 != 0) {
+            if (col.col_type == .vector and col.dimension % 64 != 0) {
                 return Error.DimensionMismatch;
             }
         }
-        const cols = try allocator.dupe(ColumnSchema, columns);
+        const cols = try allocator.alloc(ColumnSchema, columns.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (0..initialized) |j| allocator.free(cols[j].name);
+            allocator.free(cols);
+        }
+        for (columns, 0..) |col, i| {
+            cols[i] = .{
+                .name = try allocator.dupe(u8, col.name),
+                .col_type = col.col_type,
+                .dimension = col.dimension,
+                .nullable = col.nullable,
+            };
+            initialized += 1;
+        }
         return Schema{ .columns = cols, .allocator = allocator };
     }
 
     pub fn deinit(self: *Schema) void {
+        for (self.columns) |col| {
+            self.allocator.free(col.name);
+        }
         self.allocator.free(self.columns);
     }
 };
@@ -94,6 +111,7 @@ pub const Manifest = struct {
         if (bytes.len < 16) return Error.InvalidSchema;
         const version = std.mem.readInt(u64, bytes[0..8], .little);
         const count = std.mem.readInt(u64, bytes[8..16], .little);
+        if (count > std.math.maxInt(usize) / 8) return Error.InvalidSchema; // overflow protection
         if (bytes.len < 16 + count * 8) return Error.InvalidSchema;
         const offsets = try allocator.alloc(u64, @intCast(count));
         for (0..count) |i| {
@@ -164,10 +182,24 @@ pub const Dataset = struct {
 
 /// Minimal JSON schema parser (expects array of {name, type, dimension?}).
 fn parseSchemaJson(allocator: std.mem.Allocator, json: []const u8) Error![]ColumnSchema {
-    // For MVP, use a tiny hand-rolled parser or rely on Zig std.json.
     var parsed = std.json.parseFromSlice([]ColumnSchema, allocator, json, .{}) catch return Error.InvalidSchema;
     defer parsed.deinit();
-    return try allocator.dupe(ColumnSchema, parsed.value);
+    const cols = try allocator.alloc(ColumnSchema, parsed.value.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (0..initialized) |j| allocator.free(cols[j].name);
+        allocator.free(cols);
+    }
+    for (parsed.value, 0..) |col, i| {
+        cols[i] = .{
+            .name = try allocator.dupe(u8, col.name),
+            .col_type = col.col_type,
+            .dimension = col.dimension,
+            .nullable = col.nullable,
+        };
+        initialized += 1;
+    }
+    return cols;
 }
 
 // ============================================

@@ -15,17 +15,17 @@ fn monoNs() u64 {
 /// Performance benchmarks vs LanceDB & FAISS IVF-RaBitQ.
 /// Measures: QPS, latency p50/p99, recall@k, build time, memory usage, compression ratio.
 const BenchmarkConfig = struct {
-    dimensions: []const u32 = &.{ 64, 128 },
-    dataset_sizes: []const u32 = &.{ 10000 },
+    dimensions: []const u32 = &.{ 128 },
+    dataset_sizes: []const u32 = &.{ 100000 },
     query_count: u32 = 200,
     k: u32 = 10,
-    nprobe_values: []const u32 = &.{ 4, 8, 16, 32, 100 },
+    nprobe_values: []const u32 = &.{ 4, 8, 16, 32, 64, 100 },
 };
 
 /// Diagnostic config: measures coarse-only recall vs refined recall
 const DiagnosticConfig = struct {
-    dim: u32 = 64,
-    n: u32 = 10000,
+    dim: u32 = 128,
+    n: u32 = 100000,
     query_count: u32 = 100,
     k: u32 = 10,
     refine_k_values: []const u32 = &.{ 5, 10, 20, 50 },
@@ -608,10 +608,11 @@ fn runDiagnostic(allocator: std.mem.Allocator, buf: []u8) !void {
             const dot_o_bar_o = p.scalars[vi_local * 2 + 1];
             const words_per_vec = (dim + 63) / 64;
 
-            var q_residual_buf: [2048]f32 = undefined;
-            var q_r_rot_buf: [2048]f32 = undefined;
-            const q_residual = q_residual_buf[0..dim];
-            const q_r_rot = q_r_rot_buf[0..dim];
+            // Use allocator for large dimensions to avoid stack overflow.
+            const q_residual = try allocator.alloc(f32, dim);
+            defer allocator.free(q_residual);
+            const q_r_rot = try allocator.alloc(f32, dim);
+            defer allocator.free(q_r_rot);
             for (0..dim) |i| {
                 q_residual[i] = q[i] - p.centroid[i];
             }
@@ -641,7 +642,8 @@ fn runDiagnostic(allocator: std.mem.Allocator, buf: []u8) !void {
                 }
             }
             const correction = if (dot_o_bar_o > 1e-8) dot_o_bar_o else 1e-8;
-            const est_dist = residual_norm * residual_norm + q_residual_norm_sq - 2.0 * residual_norm * ip / correction;
+            const dim_f: f32 = @floatFromInt(dim);
+            const est_dist = residual_norm * residual_norm + q_residual_norm_sq - 2.0 * residual_norm * ip * correction / dim_f;
             est_dists[si] = est_dist;
         } else {
             est_dists[si] = true_dist; // fallback

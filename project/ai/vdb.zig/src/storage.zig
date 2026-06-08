@@ -14,7 +14,7 @@ const index_mod = @import("index_ivf_rq");
 /// All offsets are absolute from the start of the file.
 pub const StorageFormat = struct {
     pub const magic = "VDBCOL\x00\x00";
-    pub const version: u32 = 1;
+    pub const version: u32 = 2;
 
     pub const Header = extern struct {
         magic: [8]u8,
@@ -26,9 +26,11 @@ pub const StorageFormat = struct {
         rotation_seed: u64,
         refine_sq8: u8,
         refine_k: u32,
+        fastscan: u8,
+        query_bits: u32,
         num_super_partitions: u32,
         next_id: u32,
-        reserved: [15]u8,
+        reserved: [10]u8,
     };
 
     pub const PartitionEntry = extern struct {
@@ -93,9 +95,11 @@ pub fn saveIndex(index: *const index_mod.Index, path: []const u8) !void {
         .rotation_seed = index.config.rotation_seed,
         .refine_sq8 = if (index.config.refine_sq8) 1 else 0,
         .refine_k = index.config.refine_k,
+        .fastscan = if (index.config.fastscan) 1 else 0,
+        .query_bits = index.config.query_bits,
         .num_super_partitions = num_super,
         .next_id = index.next_id.load(.monotonic),
-        .reserved = std.mem.zeroes([15]u8),
+        .reserved = std.mem.zeroes([10]u8),
     };
     try file.writeStreamingAll(io, std.mem.asBytes(&header));
     offset += @sizeOf(StorageFormat.Header);
@@ -191,6 +195,9 @@ pub fn saveIndex(index: *const index_mod.Index, path: []const u8) !void {
         offset += entry.sub_ids_len_bytes;
     }
 
+    // Ensure data is persisted before rewriting directory
+    try file.sync(io);
+
     // Rewrite directories with correct offsets using positional writes
     try file.writePositionalAll(io, std.mem.sliceAsBytes(super_entries), super_dir_offset);
     try file.writePositionalAll(io, std.mem.sliceAsBytes(part_entries), part_dir_offset);
@@ -227,6 +234,8 @@ pub fn loadIndex(allocator: std.mem.Allocator, path: []const u8) !index_mod.Inde
         .rotation_seed = header.rotation_seed,
         .refine_sq8 = header.refine_sq8 != 0,
         .refine_k = header.refine_k,
+        .fastscan = header.fastscan != 0,
+        .query_bits = header.query_bits,
     };
 
     const dim = header.dim;
@@ -256,8 +265,9 @@ pub fn loadIndex(allocator: std.mem.Allocator, path: []const u8) !index_mod.Inde
 
     // === Partitions ===
     const partitions = try allocator.alloc(index_mod.Partition, num_partitions);
+    var partitions_initialized: usize = 0;
     errdefer {
-        for (partitions) |*p| p.deinit();
+        for (partitions[0..partitions_initialized]) |*p| p.deinit();
         allocator.free(partitions);
     }
 
@@ -278,6 +288,21 @@ pub fn loadIndex(allocator: std.mem.Allocator, path: []const u8) !index_mod.Inde
             return Error.CorruptData;
         }
 
+        // Validate sq8 offsets if present
+        if (entry.sq8_codes_len_bytes > 0) {
+            if (entry.sq8_codes_offset + entry.sq8_codes_len_bytes > file_size or
+                entry.sq8_min_offset + entry.sq8_min_len_bytes > file_size or
+                entry.sq8_scale_offset + entry.sq8_scale_len_bytes > file_size or
+                entry.sq8_max_offset + entry.sq8_max_len_bytes > file_size)
+            {
+                return Error.CorruptData;
+            }
+        }
+
+        // Validate centroid dimension consistency
+        const expected_centroid_words = dim;
+        if (entry.centroid_len_bytes != expected_centroid_words * @sizeOf(f32)) return Error.CorruptData;
+
         // centroid
         const centroid_words = entry.centroid_len_bytes / @sizeOf(f32);
         p.centroid = try allocator.alloc(f32, centroid_words);
@@ -286,6 +311,7 @@ pub fn loadIndex(allocator: std.mem.Allocator, path: []const u8) !index_mod.Inde
 
         // centroid_rot: allocated here, computed after rotation is loaded
         p.centroid_rot = try allocator.alloc(f32, centroid_words);
+        errdefer allocator.free(p.centroid_rot);
         @memset(p.centroid_rot, 0.0);
 
         // codes
@@ -333,17 +359,29 @@ pub fn loadIndex(allocator: std.mem.Allocator, path: []const u8) !index_mod.Inde
             p.sq8_scale = &[_]f32{};
             p.sq8_max = &[_]f32{};
         }
+
+        // All allocations succeeded — mark as initialized so outer errdefer calls deinit()
+        partitions_initialized += 1;
     }
 
     // === SuperPartitions ===
     const super_partitions = try allocator.alloc(index_mod.SuperPartition, num_super);
+    var super_partitions_initialized: usize = 0;
     errdefer {
-        for (super_partitions) |*sp| sp.deinit();
+        for (super_partitions[0..super_partitions_initialized]) |*sp| sp.deinit();
         allocator.free(super_partitions);
     }
 
     for (0..num_super) |si| {
         const entry = super_entries[si];
+
+        // Validate SuperPartition offsets
+        if (entry.centroid_offset + entry.centroid_len_bytes > file_size or
+            entry.sub_ids_offset + entry.sub_ids_len_bytes > file_size)
+        {
+            return Error.CorruptData;
+        }
+
         const centroid_words = entry.centroid_len_bytes / @sizeOf(f32);
         const sub_id_words = entry.sub_ids_len_bytes / @sizeOf(u32);
 
@@ -351,14 +389,18 @@ pub fn loadIndex(allocator: std.mem.Allocator, path: []const u8) !index_mod.Inde
         errdefer allocator.free(sub_ids);
         _ = try file.readPositionalAll(io, std.mem.sliceAsBytes(sub_ids), entry.sub_ids_offset);
 
+        const centroid = try allocator.alloc(f32, centroid_words);
+        errdefer allocator.free(centroid);
+
         super_partitions[si] = index_mod.SuperPartition{
             .id = @intCast(si),
-            .centroid = try allocator.alloc(f32, centroid_words),
+            .centroid = centroid,
             .sub_ids = sub_ids,
             .allocator = allocator,
         };
-        errdefer allocator.free(super_partitions[si].centroid);
         _ = try file.readPositionalAll(io, std.mem.sliceAsBytes(super_partitions[si].centroid), entry.centroid_offset);
+
+        super_partitions_initialized += 1;
     }
 
     const thread_count = @max(1, std.Thread.getCpuCount() catch 4);

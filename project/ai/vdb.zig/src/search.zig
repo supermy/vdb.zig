@@ -69,12 +69,13 @@ pub const Executor = struct {
         defer vec_results.deinit(self.allocator);
 
         if (plan.vector_query) |vq| {
-            const overfetch = @min(plan.vector_k * 4, @as(u32, 256));
+            const overfetch: u32 = if (plan.vector_k > 64) 256 else plan.vector_k * 4;
             var raw_results: [256]index_mod.SearchResult = undefined;
             const found = try self.index.search(vq, overfetch, plan.nprobe, &raw_results);
 
             // In a full implementation, each result would be checked against SQL predicate.
-            // Here we pass through for the skeleton.
+            // TODO: Apply SQL predicate filtering when row metadata access is available
+            // if (plan.sql_filter) |pred| { ... evaluatePredicate(&pred, &row) ... }
             for (0..found) |i| {
                 try vec_results.append(self.allocator, .{
                     .id = raw_results[i].id,
@@ -101,6 +102,7 @@ pub const Executor = struct {
 
         // Phase 3: Hybrid fusion
         const out = try self.allocator.alloc(SearchResult, plan.vector_k);
+        errdefer self.allocator.free(out);
         if (plan.fulltext_query != null and plan.vector_query != null) {
             // RRF fusion
             const k_rrf: f32 = 60.0;
@@ -150,6 +152,12 @@ pub const Executor = struct {
             const count = @min(out.len, vec_results.items.len);
             for (0..count) |i| {
                 out[i] = vec_results.items[i];
+            }
+            return self.allocator.realloc(out, count);
+        } else if (ft_results.items.len > 0) {
+            const count = @min(out.len, ft_results.items.len);
+            for (0..count) |i| {
+                out[i] = ft_results.items[i];
             }
             return self.allocator.realloc(out, count);
         } else {

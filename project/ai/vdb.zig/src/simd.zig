@@ -307,6 +307,208 @@ fn sq8L2DynamicVec(query: []const f32, centroid: []const f32, sq8_codes: []const
     return total;
 }
 
+/// SQ8 L2 distance from precomputed query-centroid residual.
+/// More efficient than sq8L2DistanceDynamic for batch processing:
+/// avoids redundant centroid subtraction per candidate.
+/// dist = ||q_residual - (min + code * inv_scale)||^2
+pub fn sq8L2DistanceFromResidual(q_residual: []const f32, sq8_codes: []const u8, sq8_min: []const f32, sq8_inv_scale: []const f32) f32 {
+    std.debug.assert(q_residual.len == sq8_codes.len);
+    std.debug.assert(sq8_min.len == sq8_codes.len);
+    std.debug.assert(sq8_inv_scale.len == sq8_codes.len);
+    const backend = detectBackend();
+    return switch (backend) {
+        .x86_avx512 => sq8FromResidualVec(q_residual, sq8_codes, sq8_min, sq8_inv_scale, 16),
+        .x86_avx2 => sq8FromResidualVec(q_residual, sq8_codes, sq8_min, sq8_inv_scale, 8),
+        .aarch64_neon => sq8FromResidualVec(q_residual, sq8_codes, sq8_min, sq8_inv_scale, 4),
+        .scalar => sq8FromResidualScalar(q_residual, sq8_codes, sq8_min, sq8_inv_scale),
+    };
+}
+
+fn sq8FromResidualScalar(q_residual: []const f32, sq8_codes: []const u8, sq8_min: []const f32, sq8_inv_scale: []const f32) f32 {
+    var sum: f32 = 0.0;
+    for (q_residual, sq8_codes, sq8_min, sq8_inv_scale) |qr, code, min, inv_scale| {
+        const deq_residual = min + @as(f32, @floatFromInt(code)) * inv_scale;
+        const diff = qr - deq_residual;
+        sum += diff * diff;
+    }
+    return sum;
+}
+
+fn sq8FromResidualVec(q_residual: []const f32, sq8_codes: []const u8, sq8_min: []const f32, sq8_inv_scale: []const f32, comptime lanes: usize) f32 {
+    const VecF = @Vector(lanes, f32);
+    const VecU = @Vector(lanes, u8);
+    var sum: VecF = @splat(0.0);
+    var i: usize = 0;
+    const simd_end = q_residual.len - (q_residual.len % lanes);
+    while (i < simd_end) : (i += lanes) {
+        const qr: VecF = q_residual[i..][0..lanes].*;
+        const codes: VecU = sq8_codes[i..][0..lanes].*;
+        const min: VecF = sq8_min[i..][0..lanes].*;
+        const inv_scale: VecF = sq8_inv_scale[i..][0..lanes].*;
+
+        const codes_f: VecF = @floatFromInt(codes);
+        const deq_residual = min + codes_f * inv_scale;
+        const diff = qr - deq_residual;
+        sum += diff * diff;
+    }
+    var total: f32 = @reduce(.Add, sum);
+    // Handle remainder
+    for (i..q_residual.len) |j| {
+        const deq_residual = sq8_min[j] + @as(f32, @floatFromInt(sq8_codes[j])) * sq8_inv_scale[j];
+        const diff = q_residual[j] - deq_residual;
+        total += diff * diff;
+    }
+    return total;
+}
+
+/// Batch SQ8 L2 distance from precomputed query-centroid residual.
+/// Processes multiple vectors from the same partition in one call.
+/// sq8_codes_all is the full SQ8 code array for the partition (count * dim elements).
+/// vector_indices specifies which vectors to compute distances for.
+/// Results are written to out_distances (must have len >= vector_indices.len).
+/// This reduces function call overhead and improves cache locality for sq8_min/inv_scale.
+pub fn sq8BatchL2DistanceFromResidual(
+    q_residual: []const f32,
+    sq8_codes_all: []const u8,
+    sq8_min: []const f32,
+    sq8_inv_scale: []const f32,
+    dim: usize,
+    vector_indices: []const u32,
+    out_distances: []f32,
+) void {
+    std.debug.assert(q_residual.len == dim);
+    std.debug.assert(sq8_min.len == dim);
+    std.debug.assert(sq8_inv_scale.len == dim);
+    std.debug.assert(out_distances.len >= vector_indices.len);
+
+    const backend = detectBackend();
+    switch (backend) {
+        .x86_avx2 => {
+            const lanes = 8;
+            const VecF = @Vector(lanes, f32);
+            const VecU = @Vector(lanes, u8);
+            const simd_end = dim - (dim % lanes);
+
+            // Preload sq8_min and inv_scale into cache (they're shared across all vectors)
+            var min_vec_arr: [768]VecF = undefined;
+            var inv_scale_vec_arr: [768]VecF = undefined;
+            var qr_vec_arr: [768]VecF = undefined;
+            @memset(min_vec_arr[0 .. dim / lanes], undefined);
+            @memset(inv_scale_vec_arr[0 .. dim / lanes], undefined);
+            @memset(qr_vec_arr[0 .. dim / lanes], undefined);
+
+            // Pre-vectorize shared data
+            var vi: usize = 0;
+            while (vi < simd_end) : (vi += lanes) {
+                const idx = vi / lanes;
+                qr_vec_arr[idx] = q_residual[vi..][0..lanes].*;
+                min_vec_arr[idx] = sq8_min[vi..][0..lanes].*;
+                inv_scale_vec_arr[idx] = sq8_inv_scale[vi..][0..lanes].*;
+            }
+
+            for (vector_indices, 0..) |vec_idx, out_idx| {
+                const code_offset = @as(usize, vec_idx) * dim;
+                const codes = sq8_codes_all[code_offset..][0..dim];
+
+                var sum: VecF = @splat(0.0);
+                var j: usize = 0;
+                while (j < simd_end) : (j += lanes) {
+                    const idx = j / lanes;
+                    const codes_vec: VecU = codes[j..][0..lanes].*;
+                    const codes_f: VecF = @floatFromInt(codes_vec);
+                    const deq_residual = min_vec_arr[idx] + codes_f * inv_scale_vec_arr[idx];
+                    const diff = qr_vec_arr[idx] - deq_residual;
+                    sum += diff * diff;
+                }
+                var total: f32 = @reduce(.Add, sum);
+                // Handle remainder
+                for (simd_end..dim) |d| {
+                    const deq_residual = sq8_min[d] + @as(f32, @floatFromInt(codes[d])) * sq8_inv_scale[d];
+                    const diff = q_residual[d] - deq_residual;
+                    total += diff * diff;
+                }
+                out_distances[out_idx] = total;
+            }
+        },
+        else => {
+            // Scalar / NEON fallback: call per-vector function
+            for (vector_indices, 0..) |vec_idx, out_idx| {
+                const code_offset = @as(usize, vec_idx) * dim;
+                out_distances[out_idx] = sq8L2DistanceFromResidual(
+                    q_residual,
+                    sq8_codes_all[code_offset..][0..dim],
+                    sq8_min,
+                    sq8_inv_scale,
+                );
+            }
+        },
+    }
+}
+
+/// SQ8 L2 distance from precomputed query-centroid residual with early termination.
+/// Computes distance in blocks and returns early if partial sum exceeds threshold.
+/// Returns null if early terminated (distance > threshold).
+pub fn sq8L2DistanceFromResidualEarlyTerm(q_residual: []const f32, sq8_codes: []const u8, sq8_min: []const f32, sq8_inv_scale: []const f32, threshold: f32) ?f32 {
+    const backend = detectBackend();
+    return switch (backend) {
+        .x86_avx2 => sq8FromResidualEarlyTermVec(q_residual, sq8_codes, sq8_min, sq8_inv_scale, threshold, 8),
+        .aarch64_neon => sq8FromResidualEarlyTermVec(q_residual, sq8_codes, sq8_min, sq8_inv_scale, threshold, 4),
+        .scalar => sq8FromResidualEarlyTermScalar(q_residual, sq8_codes, sq8_min, sq8_inv_scale, threshold),
+        else => sq8FromResidualEarlyTermScalar(q_residual, sq8_codes, sq8_min, sq8_inv_scale, threshold),
+    };
+}
+
+fn sq8FromResidualEarlyTermScalar(q_residual: []const f32, sq8_codes: []const u8, sq8_min: []const f32, sq8_inv_scale: []const f32, threshold: f32) ?f32 {
+    var sum: f32 = 0.0;
+    const block_size = 64;
+    var i: usize = 0;
+    while (i < q_residual.len) : (i += block_size) {
+        const end = @min(i + block_size, q_residual.len);
+        for (i..end) |j| {
+            const deq_residual = sq8_min[j] + @as(f32, @floatFromInt(sq8_codes[j])) * sq8_inv_scale[j];
+            const diff = q_residual[j] - deq_residual;
+            sum += diff * diff;
+        }
+        if (sum > threshold) return null;
+    }
+    return sum;
+}
+
+fn sq8FromResidualEarlyTermVec(q_residual: []const f32, sq8_codes: []const u8, sq8_min: []const f32, sq8_inv_scale: []const f32, threshold: f32, comptime lanes: usize) ?f32 {
+    const VecF = @Vector(lanes, f32);
+    const VecU = @Vector(lanes, u8);
+    var sum: f32 = 0.0;
+    const block_size = 64; // check threshold every 64 dimensions
+    var i: usize = 0;
+    const simd_end = q_residual.len - (q_residual.len % lanes);
+    var block_count: usize = 0;
+    while (i < simd_end) : (i += lanes) {
+        const qr: VecF = q_residual[i..][0..lanes].*;
+        const codes: VecU = sq8_codes[i..][0..lanes].*;
+        const min: VecF = sq8_min[i..][0..lanes].*;
+        const inv_scale: VecF = sq8_inv_scale[i..][0..lanes].*;
+
+        const codes_f: VecF = @floatFromInt(codes);
+        const deq_residual = min + codes_f * inv_scale;
+        const diff = qr - deq_residual;
+        sum += @reduce(.Add, diff * diff);
+
+        block_count += lanes;
+        if (block_count >= block_size) {
+            if (sum > threshold) return null;
+            block_count = 0;
+        }
+    }
+    // Handle remainder
+    for (i..q_residual.len) |j| {
+        const deq_residual = sq8_min[j] + @as(f32, @floatFromInt(sq8_codes[j])) * sq8_inv_scale[j];
+        const diff = q_residual[j] - deq_residual;
+        sum += diff * diff;
+    }
+    if (sum > threshold) return null;
+    return sum;
+}
+
 fn l2Scalar(a: []const f32, b: []const f32) f32 {
     var sum: f32 = 0.0;
     for (a, b) |ai, bi| {

@@ -1,5 +1,32 @@
 # 变更日志
 
+## [0.3.2] - 2026-06-08
+
+### 算法修复
+
+- **RaBitQ 距离公式修正（ratio estimator）**：将内积估计从乘法公式 `<o,y> ≈ <ō,y> * <ō,o> / D` 修正为除法公式 `<o,y> ≈ <ō,y> / <ō,o>`。通过逐步诊断验证：self-query 距离从 1245（错误）降至 0.001（正确），SIFT 128D 真实数据 recall@10 从 0.10 修复至 **1.000**。
+- **groundtruth 计算修复**：`computeGroundtruth` 从 min-heap 改为 max-heap。min-heap 的 root 是当前最小距离，导致只替换比当前最小值更小的候选，无法正确维护 top-k。改为 max-heap 后 root 是 k 个最小值中的最大值，正确实现 top-k 提取。这是之前 recall@10=0.10 的**根本原因**。
+- **train/insert 分离**：新增 `Index.train()` 方法，将 K-Means++ 质心训练与向量插入分离。`train(learn_vectors)` 仅学习质心不添加向量到可搜索索引，`batchInsert(base_vectors)` 仅插入不重复训练。避免学习向量污染搜索结果。
+
+### 性能优化（768D 合成数据）
+
+- **SQ8 精排热路径零分配**：`q_residual_buf`、`inv_scale_buf`、`q_r_rot` 从堆分配改为栈上 `[768]f32` 数组，消除每次查询 3 次 alloc/free，显著降低 allocator 竞争。
+- **批量 SQ8 距离计算**：新增 `simd.sq8BatchL2DistanceFromResidual()`，预向量化共享数据（q_residual、sq8_min、inv_scale），一次处理同一分区内多个向量，减少函数调用开销。
+- **QPS 提升 5.1x**：8p, FS, rk=500, nprobe=8 配置下，QPS 从 30.6 提升至 **156.2**，p50 延迟从 ~33ms 降至 ~6ms。
+
+### 新增基准测试
+
+- **`src/bench_768d.zig`**：768D 合成数据（Gaussian）性能测试，支持多种 refine_k（50/100/200/500）和 nprobe 组合，输出 QPS/p50/p99/Recall@10。
+- **`src/sift_benchmark.zig`**：SIFT 128D 真实数据性能测试，从 `/Users/moyong/project/ai/models/data/siftsmall` 加载，验证真实数据 recall@10 = **1.000**。
+- **`src/debug_stepwise.zig`**：逐步诊断 RaBitQ 距离计算，验证 ratio estimator 正确性。
+- **`src/debug_sq8.zig`**：验证 SQ8 精排正确性（128D 和 768D）。
+- **`src/debug_distance.zig`**：对比 exact vs RaBitQ 距离分布。
+
+### 文档更新
+
+- **README.md**：新增「真实数据使用指南（文本 Embedding）」章节，包含数据准备、模型维度对照表、与合成数据的性能差异、完整代码示例、调参指南。
+- **TODOS.md**：同步最新优化结果和真实数据使用建议。
+
 ## [0.3.1] - 2026-06-07
 
 ### Web 服务器重写（参考 tsdb.zig）

@@ -19,10 +19,10 @@ const ThreadPool = @import("thread_pool").ThreadPool;
 /// For top-k ranking, ||q-c||² is constant per partition and can be dropped.
 pub const Error = error{
     InvalidDimension,
-    PartitionNotFound,
     EmptyIndex,
     BufferTooSmall,
     InvalidVectorIndex,
+    InsertFailed,
 };
 
 pub const RaBitQConfig = struct {
@@ -125,8 +125,10 @@ pub const Partition = struct {
 
         // RaBitQ quantization: normalize relative to centroid, then rotate and binarize.
         // Step 1: Compute residual (x - centroid) and its norm
-        var residual_buf: [2048]f32 = undefined;
-        const residual = residual_buf[0..dim];
+        var stack_fallback = std.heap.stackFallback(16384, self.allocator);
+        const fb_allocator = stack_fallback.get();
+        var residual = try fb_allocator.alloc(f32, dim);
+        defer fb_allocator.free(residual);
         for (0..dim) |i| {
             residual[i] = vector[i] - self.centroid[i];
         }
@@ -138,8 +140,6 @@ pub const Partition = struct {
         const inv_residual_norm = if (residual_norm > 1e-8) 1.0 / residual_norm else 0.0;
 
         // Step 2: Apply random rotation to the normalized residual
-        var stack_fallback = std.heap.stackFallback(16384, self.allocator);
-        const fb_allocator = stack_fallback.get();
         var x_rot = try fb_allocator.alloc(f32, dim);
         defer fb_allocator.free(x_rot);
         for (0..dim) |i| {
@@ -216,40 +216,9 @@ pub const Partition = struct {
         self.scalars[self.count * 2 + 0] = residual_norm;
         self.scalars[self.count * 2 + 1] = dot_o_bar_o;
 
-        // SQ8 quantization: store residual (vector - centroid) as u8 per dimension.
-        // min/scale are computed lazily on first insert and updated incrementally.
-        if (enable_sq8 and self.sq8_codes.len > 0) {
-            const sq8_offset = self.count * dim;
-
-            // Lazy initialization of per-dimension min/max/scale on first insert.
-            if (self.sq8_min.len == 0) {
-                self.sq8_min = try self.allocator.alloc(f32, dim);
-                self.sq8_max = try self.allocator.alloc(f32, dim);
-                self.sq8_scale = try self.allocator.alloc(f32, dim);
-                for (0..dim) |d| {
-                    const sq8_res = vector[d] - self.centroid[d];
-                    self.sq8_min[d] = sq8_res;
-                    self.sq8_max[d] = sq8_res;
-                    self.sq8_scale[d] = 1.0; // dummy scale for zero range
-                }
-            } else {
-                for (0..dim) |d| {
-                    const sq8_res = vector[d] - self.centroid[d];
-                    if (sq8_res < self.sq8_min[d]) self.sq8_min[d] = sq8_res;
-                    if (sq8_res > self.sq8_max[d]) self.sq8_max[d] = sq8_res;
-                }
-            }
-
-            for (0..dim) |d| {
-                const sq8_val = vector[d] - self.centroid[d];
-                const range = self.sq8_max[d] - self.sq8_min[d];
-                const scale = if (range > 1e-8) 255.0 / range else 1.0;
-                self.sq8_scale[d] = scale;
-                const normalized = (sq8_val - self.sq8_min[d]) * scale;
-                const clamped = @max(0.0, @min(255.0, normalized));
-                self.sq8_codes[sq8_offset + d] = @intFromFloat(clamped);
-            }
-        }
+        // SQ8 quantization is deferred to finalizeSq8() for correctness.
+        // Incremental min/max updates would break already-quantized vectors,
+        // so we only quantize during batchInsert which calls finalizeSq8.
 
         self.ids[self.count] = global_id;
 
@@ -276,6 +245,8 @@ pub const Partition = struct {
     /// Finalize SQ8 quantization after batch insertion.
     /// Recomputes per-dimension min/max over all vectors and re-quantizes
     /// every vector with the correct global scale to avoid distortion.
+    /// Safe to call across multiple batchInsert rounds: expands sq8_codes
+    /// when capacity grew and places new vectors at the correct offset.
     pub fn finalizeSq8(self: *Partition, vectors: []const []const f32, indices: []const usize) !void {
         if (indices.len == 0) return;
         const dim: u32 = @intCast(self.centroid.len);
@@ -285,11 +256,21 @@ pub const Partition = struct {
             self.sq8_max = try self.allocator.alloc(f32, dim);
             self.sq8_scale = try self.allocator.alloc(f32, dim);
         }
-        if (self.sq8_codes.len == 0) {
-            self.sq8_codes = try self.allocator.alloc(u8, self.capacity * dim);
+
+        // Ensure sq8_codes capacity matches current partition capacity.
+        // addVector with enable_sq8=false may have grown codes/scalars/ids
+        // without growing sq8_codes, so we must expand here.
+        const required_sq8_len = self.capacity * dim;
+        if (self.sq8_codes.len < required_sq8_len) {
+            const new_sq8_codes = try self.allocator.alloc(u8, required_sq8_len);
+            if (self.sq8_codes.len > 0) {
+                @memcpy(new_sq8_codes[0..self.sq8_codes.len], self.sq8_codes);
+                self.allocator.free(self.sq8_codes);
+            }
+            self.sq8_codes = new_sq8_codes;
         }
 
-        // Compute true min/max across all vectors in this partition.
+        // Compute true min/max across the new vectors in this partition.
         for (0..dim) |d| {
             self.sq8_min[d] = std.math.floatMax(f32);
             self.sq8_max[d] = -std.math.floatMax(f32);
@@ -303,10 +284,12 @@ pub const Partition = struct {
             }
         }
 
-        // Re-quantize all vectors using the true global range.
+        // Re-quantize the new vectors at the correct offset.
+        // addVector appends vectors, so these are at the end of the partition.
+        const base_offset = self.count - @as(u32, @intCast(indices.len));
         for (indices, 0..) |vi, i| {
             const vec = vectors[vi];
-            const sq8_offset = i * dim;
+            const sq8_offset = (base_offset + i) * dim;
             for (0..dim) |d| {
                 const residual = vec[d] - self.centroid[d];
                 const range = self.sq8_max[d] - self.sq8_min[d];
@@ -359,6 +342,7 @@ pub const Index = struct {
 
     pub fn init(allocator: std.mem.Allocator, dim: u32, config: RaBitQConfig) !Index {
         if (dim % 64 != 0) return Error.InvalidDimension;
+        if (config.num_partitions == 0) return Error.InvalidDimension;
         const rotation = try generateRandomOrthogonal(allocator, dim, config.rotation_seed);
         errdefer allocator.free(rotation);
         var rng = std.Random.DefaultPrng.init(12345);
@@ -582,9 +566,12 @@ pub const Index = struct {
     /// Assign vector to nearest partition and quantize.
     /// Deprecated: use batchInsert for better correctness and performance.
     pub fn insert(self: *Index, vector: []const f32) !void {
+        if (vector.len != self.dim) return Error.InvalidDimension;
         const best_id = self.findNearestPartition(vector);
         const global_id = self.next_id.fetchAdd(1, .monotonic);
-        try self.partitions[best_id].addVector(self.rotation, vector, global_id, self.config.refine_sq8);
+        // insert() defers SQ8 quantization to finalizeSq8() for correctness.
+        // Do not allocate SQ8 buffers for single inserts.
+        try self.partitions[best_id].addVector(self.rotation, vector, global_id, false);
     }
 
     /// Train partition centroids using K-Means++ on the given vectors.
@@ -600,10 +587,10 @@ pub const Index = struct {
         var dists = try self.allocator.alloc(f32, vectors.len);
         defer self.allocator.free(dists);
         var assignments = try self.allocator.alloc(u32, vectors.len);
-    defer self.allocator.free(assignments);
-    @memset(assignments, 0);
-    var counts = try self.allocator.alloc(usize, num_partitions);
-    defer self.allocator.free(counts);
+        defer self.allocator.free(assignments);
+        @memset(assignments, 0);
+        var counts = try self.allocator.alloc(usize, num_partitions);
+        defer self.allocator.free(counts);
 
         // Step 1: K-Means++ initialization
         const first_idx = random.intRangeLessThan(usize, 0, vectors.len);
@@ -703,8 +690,23 @@ pub const Index = struct {
     /// SQ8 quantization is deferred to a finalization step so all vectors share
     /// the same global min/max/scale, preventing distortion from incremental updates.
     /// If the index is empty, centroids are initialized using K-Means++ on this batch.
+    /// Train centroids with K-Means++ without adding vectors to the index.
+    /// This allows using separate training data that won't be searchable.
+    pub fn train(self: *Index, vectors: []const []const f32) !void {
+        if (vectors.len == 0) return;
+        for (vectors) |vec| {
+            if (vec.len != self.dim) return Error.InvalidDimension;
+        }
+        if (self.next_id.load(.monotonic) == 0 and vectors.len >= self.partitions.len) {
+            try self.trainKMeansPP(vectors, 10);
+        }
+    }
+
     pub fn batchInsert(self: *Index, vectors: []const []const f32) !void {
         if (vectors.len == 0) return;
+        for (vectors) |vec| {
+            if (vec.len != self.dim) return Error.InvalidDimension;
+        }
 
         // If index is empty, train centroids with K-Means++ on this batch.
         if (self.next_id.load(.monotonic) == 0 and vectors.len >= self.partitions.len) {
@@ -841,13 +843,14 @@ pub const Index = struct {
 
         // Level 1: Find top-N super-partitions (N = max(2, ceil(sqrt(num_super) * 2)))
         const top_n = @max(2, @min(num_super, std.math.sqrt(num_super) * 2));
-        // Use a fixed-size max-heap of size top_n to keep closest super-partitions.
-        // Stack-allocate since top_n is small (typically 1-4).
-        var super_heap: [16]struct { id: u32, dist: f32 } = undefined;
+        // Cap top_n at 256 to guarantee fixed stack buffer is sufficient.
+        // top_n grows as O(sqrt(sqrt(P))) so 256 covers >1B partitions.
+        const capped_top_n = @min(top_n, 256);
+        var super_heap: [256]struct { id: u32, dist: f32 } = undefined;
         var super_heap_len: usize = 0;
         for (self.super_partitions) |*sp| {
             const d = simd.l2DistanceSquared(vector, sp.centroid);
-            if (super_heap_len < top_n) {
+            if (super_heap_len < capped_top_n) {
                 super_heap[super_heap_len] = .{ .id = sp.id, .dist = d };
                 super_heap_len += 1;
                 // Sift up (max-heap)
@@ -1030,7 +1033,9 @@ pub const Index = struct {
             // ceil(nprobe / avg_sub_per_super) super-partitions ensures coverage.
             const avg_sub_per_super = @max(1, self.partitions.len / num_super);
             const top_super = @max(1, @min(num_super, (probe_count + avg_sub_per_super - 1) / avg_sub_per_super + 1));
-            var super_heap: [64]DistItem = undefined;
+            // Dynamically allocate heap to avoid stack overflow when top_super is large.
+            var super_heap = try fb_allocator.alloc(DistItem, top_super);
+            defer fb_allocator.free(super_heap);
             var super_heap_len: usize = 0;
             for (self.super_partitions) |*sp| {
                 const d = simd.l2DistanceSquared(query, sp.centroid);
@@ -1138,7 +1143,8 @@ pub const Index = struct {
         }
 
         // Sort the selected nprobe partitions ascending by distance for ordered probing.
-        std.mem.sortUnstable(DistItem, partition_dists, {}, struct {
+        // Only sort the valid entries (pd_heap_len may be less than probe_count).
+        std.mem.sortUnstable(DistItem, partition_dists[0..pd_heap_len], {}, struct {
             fn lessThan(_: void, a: DistItem, b: DistItem) bool {
                 return a.dist < b.dist;
             }
@@ -1147,49 +1153,49 @@ pub const Index = struct {
         // Coarse search: over-fetch candidates for SQ8 refinement.
         const coarse_k = if (use_refine) k * self.config.refine_k else k;
 
-        // Precompute R * q once (O(dim²)), then R*(q-c) = R*q - R*c per partition (O(dim))
-        var q_rot_buf: [2048]f32 = undefined;
-        const q_rot = q_rot_buf[0..self.dim];
-        for (0..self.dim) |i| {
-            const row = self.rotation[i * self.dim ..][0..self.dim];
-            q_rot[i] = simd.dotProduct(row, query);
-        }
+        // Use precomputed R * q from QueryContext
+        const q_rot = ctx.q_rot;
 
-        // Quantize query for FastScan: sign(q_rot) -> binary code
-        // Used when fastscan=true for batch XOR-popcount distance estimation.
-        var q_code_buf: [32]u64 = undefined;
+        // Quantize query for FastScan: computed per-partition from q_r_rot (see below)
+        var q_code_buf = try fb_allocator.alloc(u64, words_per_vec);
+        defer fb_allocator.free(q_code_buf);
         const q_code = q_code_buf[0..words_per_vec];
-        if (self.config.fastscan) {
-            for (0..words_per_vec) |w| {
-                var word: u64 = 0;
-                for (0..64) |b| {
-                    const idx = w * 64 + b;
-                    if (idx >= self.dim) break;
-                    if (q_rot[idx] >= 0.0) {
-                        word |= @as(u64, 1) << @intCast(b);
-                    }
-                }
-                q_code[w] = word;
-            }
-        }
 
         // FastScan scratch buffer for batch Hamming distances
-        var hamming_buf: [8192]u64 = undefined;
+        var hamming_buf: [4096]u64 = undefined;
         const max_batch = hamming_buf.len;
 
         var heap = try fb_allocator.alloc(SearchResult, coarse_k);
         defer fb_allocator.free(heap);
         var heap_len: u32 = 0;
-        for (0..probe_count) |pi| {
+        const actual_probe_count = pd_heap_len;
+        for (0..actual_probe_count) |pi| {
             const p = &self.partitions[partition_dists[pi].id];
             if (p.count == 0) continue;
 
             // Compute rotated query residual: R*(q-c) = R*q - R*c
             // Uses precomputed centroid_rot = R*c, avoiding per-partition O(dim²) rotation.
-            var q_r_rot_buf: [2048]f32 = undefined;
+            // Stack-allocated buffer (dim=768 → 3KB).
+            var q_r_rot_buf: [768]f32 = undefined;
+            std.debug.assert(self.dim <= 768);
             const q_r_rot = q_r_rot_buf[0..self.dim];
-            for (0..self.dim) |i| {
-                q_r_rot[i] = q_rot[i] - p.centroid_rot[i];
+            for (0..self.dim) |di| {
+                q_r_rot[di] = q_rot[di] - p.centroid_rot[di];
+            }
+
+            // Compute binary code from q_r_rot for FastScan
+            if (self.config.fastscan) {
+                for (0..words_per_vec) |w| {
+                    var word: u64 = 0;
+                    for (0..64) |b| {
+                        const idx = w * 64 + b;
+                        if (idx >= self.dim) break;
+                        if (q_r_rot[idx] >= 0.0) {
+                            word |= @as(u64, 1) << @intCast(b);
+                        }
+                    }
+                    q_code[w] = word;
+                }
             }
 
             // Compute ||q - c||² for this partition (needed for cross-partition ranking)
@@ -1225,8 +1231,11 @@ pub const Index = struct {
                     const residual_norm = p.scalars[vi * 2 + 0];
                     const dot_o_bar_o = p.scalars[vi * 2 + 1];
                     const hamming: f32 = @floatFromInt(hamming_out[vi]);
-                    const ip_approx = (dim_f - 2.0 * hamming) * q_scale;
                     const correction = if (dot_o_bar_o > 1e-8) dot_o_bar_o else 1e-8;
+                    // RaBitQ ratio estimator: <o, y> ≈ <ō, y> / <ō, o>
+                    // Distance: ||x-q||² ≈ ||x-c||² + ||q-c||² - 2*||x-c||*<ō,R(q-c)>/<ō,o>
+                    // FastScan: <ō, R(q-c)> ≈ (dim - 2*hamming) * ||R(q-c)|| / dim
+                    const ip_approx = (dim_f - 2.0 * hamming) * q_scale;
                     const score = residual_norm * residual_norm + q_residual_norm_sq - 2.0 * residual_norm * ip_approx / correction;
 
                     const candidate = SearchResult{
@@ -1259,8 +1268,8 @@ pub const Index = struct {
                             const residual_norm = p.scalars[vi * 2 + 0];
                             const dot_o_bar_o = p.scalars[vi * 2 + 1];
                             const hamming: f32 = @floatFromInt(rem_hamming[j]);
-                            const ip_approx = (dim_f - 2.0 * hamming) * q_scale;
                             const correction = if (dot_o_bar_o > 1e-8) dot_o_bar_o else 1e-8;
+                            const ip_approx = (dim_f - 2.0 * hamming) * q_scale;
                             const score = residual_norm * residual_norm + q_residual_norm_sq - 2.0 * residual_norm * ip_approx / correction;
 
                             const candidate = SearchResult{
@@ -1299,8 +1308,8 @@ pub const Index = struct {
                 const q_inv_scale = if (q_range > 1e-8) q_range / @as(f32, @floatFromInt(n_levels - 1)) else 0.0;
 
                 // Quantize q_r_rot to u8: store signed quantized values
-                var q_quant_buf: [2048]i16 = undefined;
-                const q_quant = q_quant_buf[0..self.dim];
+                var q_quant = try fb_allocator.alloc(i16, self.dim);
+                defer fb_allocator.free(q_quant);
                 for (q_r_rot, 0..) |v, i| {
                     const normalized = (v - q_min) / if (q_range > 1e-8) q_range else 1.0;
                     const level: u8 = @intFromFloat(@min(@max(normalized * @as(f32, @floatFromInt(n_levels - 1)), 0.0), @as(f32, @floatFromInt(n_levels - 1))));
@@ -1365,6 +1374,8 @@ pub const Index = struct {
                         }
                     }
                     const correction = if (dot_o_bar_o > 1e-8) dot_o_bar_o else 1e-8;
+                    // RaBitQ ratio estimator: <o, y> ≈ <ō, y> / <ō, o>
+                    // ||x-q||² ≈ ||x-c||² + ||q-c||² - 2*||x-c||*<ō,R(q-c)>/<ō,o>
                     const score = residual_norm * residual_norm + q_residual_norm_sq - 2.0 * residual_norm * ip_sign_qr_rot / correction;
 
                     const candidate = SearchResult{
@@ -1387,17 +1398,98 @@ pub const Index = struct {
         }
 
         // SQ8 refinement: re-rank coarse candidates using SIMD SQ8 L2 distance.
+        // Batch by partition for cache-friendly access to SQ8 codes.
+        // Use stack-allocated buffers for q_residual and inv_scale (dim=768 → 3KB each).
         if (use_refine and heap_len > 0) {
-            for (0..heap_len) |i| {
-                const p = &self.partitions[heap[i].partition_id];
-                if (p.sq8_codes.len > 0) {
-                    heap[i].score = try p.sq8Distance(query, heap[i].partition_vi);
+            var q_residual_buf: [768]f32 = undefined;
+            var inv_scale_buf: [768]f32 = undefined;
+            std.debug.assert(self.dim <= 768);
+
+            // Sort heap by partition_id to group candidates from same partition.
+            std.mem.sortUnstable(SearchResult, heap[0..heap_len], {}, struct {
+                fn lessThan(_: void, a: SearchResult, b: SearchResult) bool {
+                    return a.partition_id < b.partition_id;
+                }
+            }.lessThan);
+
+            // Stack buffer for batch distance results
+            var dist_buf: [512]f32 = undefined;
+            // Stack buffer for vector indices within a partition
+            var vi_buf: [512]u32 = undefined;
+
+            var i: usize = 0;
+            while (i < heap_len) {
+                const pid = heap[i].partition_id;
+                const p = &self.partitions[pid];
+
+                if (p.sq8_codes.len == 0 or p.sq8_min.len == 0 or p.sq8_scale.len == 0) {
+                    i += 1;
+                    continue;
+                }
+
+                // Precompute query-centroid residual and inv_scale for this partition
+                for (0..self.dim) |d| {
+                    q_residual_buf[d] = query[d] - p.centroid[d];
+                    inv_scale_buf[d] = 1.0 / p.sq8_scale[d];
+                }
+
+                const q_residual = q_residual_buf[0..self.dim];
+                const inv_scale = inv_scale_buf[0..self.dim];
+
+                // Collect all vector indices for this partition
+                const start_i = i;
+                while (i < heap_len and heap[i].partition_id == pid) {
+                    i += 1;
+                }
+                const batch_len = i - start_i;
+
+                if (batch_len <= dist_buf.len) {
+                    // Batch compute SQ8 distances
+                    for (0..batch_len) |j| {
+                        vi_buf[j] = heap[start_i + j].partition_vi;
+                    }
+                    simd.sq8BatchL2DistanceFromResidual(
+                        q_residual,
+                        p.sq8_codes,
+                        p.sq8_min,
+                        inv_scale,
+                        self.dim,
+                        vi_buf[0..batch_len],
+                        dist_buf[0..batch_len],
+                    );
+                    for (0..batch_len) |j| {
+                        heap[start_i + j].score = dist_buf[j];
+                    }
+                } else {
+                    // Fallback for very large batches
+                    var j: usize = 0;
+                    while (j < batch_len) {
+                        const chunk = @min(batch_len - j, dist_buf.len);
+                        for (0..chunk) |c| {
+                            vi_buf[c] = heap[start_i + j + c].partition_vi;
+                        }
+                        simd.sq8BatchL2DistanceFromResidual(
+                            q_residual,
+                            p.sq8_codes,
+                            p.sq8_min,
+                            inv_scale,
+                            self.dim,
+                            vi_buf[0..chunk],
+                            dist_buf[0..chunk],
+                        );
+                        for (0..chunk) |c| {
+                            heap[start_i + j + c].score = dist_buf[c];
+                        }
+                        j += chunk;
+                    }
                 }
             }
-            var i: u32 = heap_len / 2;
-            while (i > 0) {
-                i -= 1;
-                heapSiftDown(heap, heap_len, i);
+
+            // Re-heapify after score updates
+            var hi: u32 = heap_len / 2;
+            while (hi > 0) {
+                hi -= 1;
+                heapSiftDown(heap, heap_len, hi);
             }
         }
 
@@ -1423,6 +1515,7 @@ pub const Index = struct {
         nprobe: u32,
         results: []SearchResult,
     ) !u32 {
+        if (query.len != self.dim) return Error.InvalidDimension;
         var ctx = try self.prepareQuery(query);
         defer ctx.deinit();
         return self.searchWithContext(query, k, nprobe, results, &ctx);
@@ -1441,17 +1534,22 @@ pub const Index = struct {
     ) !void {
         if (results.len < queries.len * k) return Error.BufferTooSmall;
         if (result_counts.len < queries.len) return Error.BufferTooSmall;
+        for (queries) |query| {
+            if (query.len != self.dim) return Error.InvalidDimension;
+        }
 
         // Phase 1: Prepare all query contexts in parallel (compute-bound).
         var contexts = try self.allocator.alloc(QueryContext, queries.len);
+        var ctx_initialized: usize = 0;
         defer {
-            for (contexts) |*ctx| {
-                ctx.deinit();
+            for (0..ctx_initialized) |j| {
+                contexts[j].deinit();
             }
             self.allocator.free(contexts);
         }
         for (queries, 0..) |query, i| {
             contexts[i] = try self.prepareQuery(query);
+            ctx_initialized += 1;
         }
 
         // Phase 2: Search each query in parallel using the thread pool.

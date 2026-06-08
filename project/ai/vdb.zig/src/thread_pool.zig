@@ -145,7 +145,7 @@ pub const ThreadPool = struct {
     }
 
     fn workerLoop(pool: *ThreadPool) void {
-        while (!pool.shutdown.load(.acquire)) {
+        while (true) {
             spinLock(&pool.mutex);
             if (pool.queue.items.len > 0) {
                 const task = pool.queue.pop().?;
@@ -155,6 +155,9 @@ pub const ThreadPool = struct {
                 task.func(task.ctx);
 
                 _ = pool.active.fetchSub(1, .release);
+            } else if (pool.shutdown.load(.acquire)) {
+                pool.mutex.unlock();
+                break;
             } else {
                 pool.mutex.unlock();
                 std.Thread.yield() catch {};

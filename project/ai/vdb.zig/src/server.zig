@@ -227,20 +227,37 @@ pub fn main() !void {
         const client_fd = c.accept(fd, @ptrCast(&client_addr), &addr_len);
         if (client_fd < 0) continue;
 
-        handleConnection(allocator, client_fd, &idx, &idx_mutex, &raw_store) catch |err| {
-            std.log.err("Connection error: {}", .{err});
+        // Spawn a thread per connection so slow requests (benchmark) don't block others
+        const t = std.Thread.spawn(.{}, handleConnection, .{ allocator, client_fd, &idx, &idx_mutex, &raw_store }) catch {
+            // Fallback: handle synchronously if thread spawn fails
+            handleConnection(allocator, client_fd, &idx, &idx_mutex, &raw_store) catch |err| {
+                std.log.err("Connection error: {}", .{err});
+            };
+            _ = c.close(client_fd);
+            continue;
         };
-        _ = c.close(client_fd);
+        t.detach();
     }
 }
 
 // ── HTTP helpers (same pattern as tsdb.zig) ──────────────────────────
 
+/// Loop-send until all bytes are written or an error occurs.
+fn sendAll(client_fd: c_int, data: []const u8) !void {
+    var sent: usize = 0;
+    while (sent < data.len) {
+        const n = c.send(client_fd, data.ptr + sent, data.len - sent, 0);
+        if (n < 0) return error.SendFailed;
+        if (n == 0) return error.ConnectionClosed;
+        sent += @as(usize, @intCast(n));
+    }
+}
+
 fn sendResponse(client_fd: c_int, status: []const u8, content_type: []const u8, body: []const u8) !void {
     var header_buf: [512]u8 = undefined;
     const header = try std.fmt.bufPrint(&header_buf, "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n", .{ status, content_type, body.len });
-    _ = c.send(client_fd, header.ptr, header.len, 0);
-    _ = c.send(client_fd, body.ptr, body.len, 0);
+    try sendAll(client_fd, header);
+    try sendAll(client_fd, body);
 }
 
 fn sendJson(client_fd: c_int, body: []const u8) !void {
@@ -253,7 +270,7 @@ fn sendJsonError(client_fd: c_int, status: []const u8, body: []const u8) !void {
 
 fn sendCorsResponse(client_fd: c_int) !void {
     const headers = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n";
-    _ = c.send(client_fd, headers.ptr, headers.len, 0);
+    try sendAll(client_fd, headers);
 }
 
 // ── Connection handler (same pattern as tsdb.zig) ────────────────────
@@ -265,12 +282,15 @@ fn handleConnection(
     rwlock: *std.atomic.Mutex,
     raw_store: *RawVectorStore,
 ) !void {
+    defer _ = c.close(client_fd);
+
     // Allocate 1MB buffer for request (same as tsdb.zig)
     const alloc_buf = try allocator.alloc(u8, 1048576);
     defer allocator.free(alloc_buf);
 
     // Loop recv until complete HTTP request received
     var total: usize = 0;
+    var request_complete = false;
     while (total < alloc_buf.len) {
         const n = c.recv(client_fd, alloc_buf.ptr + total, alloc_buf.len - total, 0);
         if (n <= 0) break;
@@ -287,15 +307,23 @@ fn handleConnection(
                     const cl_val_end = std.mem.indexOfAnyPos(u8, header, cl_val_start, "\r\n") orelse header.len;
                     const content_length = std.fmt.parseInt(usize, header[cl_val_start..cl_val_end], 10) catch 0;
                     const body_received = total - (body_start + 4);
-                    if (body_received >= content_length) break;
+                    if (body_received >= content_length) {
+                        request_complete = true;
+                        break;
+                    }
                 } else {
                     // No Content-Length, header end means request complete
+                    request_complete = true;
                     break;
                 }
             }
         }
     }
     if (total == 0) return;
+    if (!request_complete) {
+        try sendJsonError(client_fd, "413 Payload Too Large", "{\"status\":\"error\",\"message\":\"Request too large\"}");
+        return;
+    }
     const request = alloc_buf[0..total];
 
     // Extract method and path for logging
@@ -311,31 +339,31 @@ fn handleConnection(
     const t0 = monoNs();
     var status_code: []const u8 = "200";
 
-    // Route matching
-    if (std.mem.startsWith(u8, request, "GET / ") or std.mem.startsWith(u8, request, "GET /index.html")) {
+    // Route matching — use extracted path for precise matching
+    if (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/index.html")) {
         try sendResponse(client_fd, "200 OK", "text/html; charset=utf-8", INDEX_HTML);
-    } else if (std.mem.startsWith(u8, request, "GET /app.js")) {
+    } else if (std.mem.eql(u8, path, "/app.js")) {
         try sendResponse(client_fd, "200 OK", "application/javascript", APP_JS);
-    } else if (std.mem.startsWith(u8, request, "GET /style.css")) {
+    } else if (std.mem.eql(u8, path, "/style.css")) {
         try sendResponse(client_fd, "200 OK", "text/css", STYLE_CSS);
-    } else if (std.mem.startsWith(u8, request, "OPTIONS ")) {
+    } else if (std.mem.eql(u8, method, "OPTIONS")) {
         try sendCorsResponse(client_fd);
         status_code = "204";
-    } else if (std.mem.startsWith(u8, request, "POST /v1/search")) {
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/search")) {
         try handleSearch(allocator, client_fd, request, idx, rwlock);
-    } else if (std.mem.startsWith(u8, request, "POST /v1/batch_search")) {
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/batch_search")) {
         try handleBatchSearch(allocator, client_fd, request, idx, rwlock);
-    } else if (std.mem.startsWith(u8, request, "POST /v1/import ")) {
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/import")) {
         try handleImport(allocator, client_fd, request, idx, rwlock, raw_store);
-    } else if (std.mem.startsWith(u8, request, "POST /v1/export ")) {
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/export")) {
         try handleExport(allocator, client_fd, request, idx);
-    } else if (std.mem.startsWith(u8, request, "POST /v1/benchmark")) {
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/benchmark")) {
         try handleBenchmark(allocator, client_fd, request);
-    } else if (std.mem.startsWith(u8, request, "GET /v1/stats")) {
+    } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/stats")) {
         try handleStats(allocator, client_fd, idx);
-    } else if (std.mem.startsWith(u8, request, "POST /v1/recall_test")) {
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/recall_test")) {
         try handleRecallTest(allocator, client_fd, request, idx, rwlock, raw_store);
-    } else if (std.mem.startsWith(u8, request, "GET /health")) {
+    } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) {
         try sendJson(client_fd, "{\"status\":\"ok\",\"version\":\"0.3.0\"}");
     } else {
         try sendJsonError(client_fd, "404 Not Found", "{\"status\":\"error\",\"message\":\"Not Found\"}");
@@ -372,6 +400,13 @@ fn handleSearch(
 
     const k = @min(parsed.value.k orelse 10, 256);
     const nprobe = parsed.value.nprobe orelse 8;
+
+    if (parsed.value.vector.len != idx.dim) {
+        var err_buf: [256]u8 = undefined;
+        const err_msg = try std.fmt.bufPrint(&err_buf, "{{\"status\":\"error\",\"message\":\"Vector dimension mismatch: expected {d}, got {d}\"}}", .{ idx.dim, parsed.value.vector.len });
+        try sendJson(client_fd, err_msg);
+        return;
+    }
 
     var results: [256]index_mod.SearchResult = undefined;
     spinLock(rwlock);
@@ -425,11 +460,21 @@ fn handleBatchSearch(
 
     for (parsed.value.queries, 0..) |q, qi| {
         if (qi > 0) try json.appendSlice(allocator, ",");
+        if (q.vector.len != idx.dim) {
+            var err_buf: [256]u8 = undefined;
+            const err_item = try std.fmt.bufPrint(&err_buf, "{{\"status\":\"error\",\"message\":\"Query {d} dimension mismatch: expected {d}, got {d}\"}}", .{ qi, idx.dim, q.vector.len });
+            try json.appendSlice(allocator, err_item);
+            continue;
+        }
         const k = @min(q.k orelse 10, 256);
         var results: [256]index_mod.SearchResult = undefined;
+
         spinLock(rwlock);
-        defer rwlock.unlock();
-        const found = idx.search(q.vector, k, nprobe, &results) catch continue;
+        const found = idx.search(q.vector, k, nprobe, &results) catch {
+            rwlock.unlock();
+            continue;
+        };
+        rwlock.unlock();
 
         try json.appendSlice(allocator, "[");
         for (0..found) |i| {
@@ -463,18 +508,35 @@ fn handleImport(
     };
     defer parsed.deinit();
 
+    for (parsed.value.vectors, 0..) |vec, i| {
+        if (vec.len != idx.dim) {
+            var err_buf: [256]u8 = undefined;
+            const err_msg = try std.fmt.bufPrint(&err_buf, "{{\"status\":\"error\",\"message\":\"Vector {d} dimension mismatch: expected {d}, got {d}\"}}", .{ i, idx.dim, vec.len });
+            try sendJson(client_fd, err_msg);
+            return;
+        }
+    }
+
     spinLock(rwlock);
     defer rwlock.unlock();
     try idx.batchInsert(parsed.value.vectors);
     const imported = parsed.value.vectors.len;
 
+    var raw_added: u32 = 0;
     for (parsed.value.vectors) |vec| {
         raw_store.addVector(allocator, vec) catch break;
+        raw_added += 1;
     }
 
-    var resp_buf: [128]u8 = undefined;
-    const resp = try std.fmt.bufPrint(&resp_buf, "{{\"status\":\"ok\",\"imported\":{d}}}", .{imported});
-    try sendJson(client_fd, resp);
+    if (raw_added < imported) {
+        var resp_buf: [256]u8 = undefined;
+        const resp = try std.fmt.bufPrint(&resp_buf, "{{\"status\":\"warning\",\"imported\":{d},\"raw_stored\":{d},\"message\":\"Some vectors failed to store in raw_store\"}}", .{ imported, raw_added });
+        try sendJson(client_fd, resp);
+    } else {
+        var resp_buf: [128]u8 = undefined;
+        const resp = try std.fmt.bufPrint(&resp_buf, "{{\"status\":\"ok\",\"imported\":{d}}}", .{imported});
+        try sendJson(client_fd, resp);
+    }
 }
 
 fn handleExport(
@@ -532,7 +594,8 @@ fn handleBenchmark(
     var rng = std.Random.DefaultPrng.init(42);
 
     // Generate dataset
-    const dataset = bench_allocator.alloc(f32, n * dim) catch {
+    const dataset_size = @as(usize, n) * @as(usize, dim);
+    const dataset = bench_allocator.alloc(f32, dataset_size) catch {
         try sendJson(client_fd, "{\"status\":\"error\",\"message\":\"Failed to allocate dataset\"}");
         return;
     };

@@ -135,6 +135,121 @@ pub fn build(b: *std.Build) void {
     bench_mod.addImport("storage", storage_mod);
     b.installArtifact(benchmark);
 
+    // SIFT benchmark executable
+    const sift_bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/sift_benchmark.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const sift_benchmark = b.addExecutable(.{
+        .name = "vdb-sift-benchmark",
+        .root_module = sift_bench_mod,
+    });
+    sift_bench_mod.addImport("vdb", vdb_mod);
+    sift_bench_mod.addImport("simd", simd_mod);
+    sift_bench_mod.addImport("index_ivf_rq", index_mod);
+    sift_bench_mod.addImport("search", search_mod);
+    sift_bench_mod.addImport("gpu", gpu_mod);
+    sift_bench_mod.addImport("storage", storage_mod);
+    b.installArtifact(sift_benchmark);
+
+    const run_sift_benchmark = b.addRunArtifact(sift_benchmark);
+    const sift_benchmark_step = b.step("sift-benchmark", "Run SIFT small benchmark");
+    sift_benchmark_step.dependOn(&run_sift_benchmark.step);
+
+    // 768D synthetic benchmark executable
+    const bench_768d_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench_768d.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const bench_768d = b.addExecutable(.{
+        .name = "vdb-bench-768d",
+        .root_module = bench_768d_mod,
+    });
+    bench_768d_mod.addImport("vdb", vdb_mod);
+    bench_768d_mod.addImport("simd", simd_mod);
+    bench_768d_mod.addImport("index_ivf_rq", index_mod);
+    bench_768d_mod.addImport("search", search_mod);
+    bench_768d_mod.addImport("gpu", gpu_mod);
+    bench_768d_mod.addImport("storage", storage_mod);
+    b.installArtifact(bench_768d);
+
+    const run_bench_768d = b.addRunArtifact(bench_768d);
+    const bench_768d_step = b.step("bench-768d", "Run 768D synthetic benchmark");
+    bench_768d_step.dependOn(&run_bench_768d.step);
+
+    // Debug self-query executable
+    const debug_sq_mod = b.createModule(.{
+        .root_source_file = b.path("src/debug_selfquery.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const debug_sq = b.addExecutable(.{
+        .name = "vdb-debug-sq",
+        .root_module = debug_sq_mod,
+    });
+    debug_sq_mod.addImport("index_ivf_rq", index_mod);
+    b.installArtifact(debug_sq);
+
+    const run_debug_sq = b.addRunArtifact(debug_sq);
+    const debug_sq_step = b.step("debug-sq", "Run self-query debug");
+    debug_sq_step.dependOn(&run_debug_sq.step);
+
+    // Debug distance estimation executable
+    const debug_dist_mod = b.createModule(.{
+        .root_source_file = b.path("src/debug_distance.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const debug_dist = b.addExecutable(.{
+        .name = "vdb-debug-dist",
+        .root_module = debug_dist_mod,
+    });
+    debug_dist_mod.addImport("index_ivf_rq", index_mod);
+    debug_dist_mod.addImport("simd", simd_mod);
+    b.installArtifact(debug_dist);
+
+    const run_debug_dist = b.addRunArtifact(debug_dist);
+    const debug_dist_step = b.step("debug-dist", "Run distance estimation debug");
+    debug_dist_step.dependOn(&run_debug_dist.step);
+
+    // Step-by-step distance diagnosis executable
+    const debug_sw_mod = b.createModule(.{
+        .root_source_file = b.path("src/debug_stepwise.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const debug_sw = b.addExecutable(.{
+        .name = "vdb-debug-sw",
+        .root_module = debug_sw_mod,
+    });
+    debug_sw_mod.addImport("index_ivf_rq", index_mod);
+    debug_sw_mod.addImport("simd", simd_mod);
+    b.installArtifact(debug_sw);
+
+    const run_debug_sw = b.addRunArtifact(debug_sw);
+    const debug_sw_step = b.step("debug-sw", "Run stepwise distance diagnosis");
+    debug_sw_step.dependOn(&run_debug_sw.step);
+
+    // SQ8 verification executable
+    const debug_sq8_mod = b.createModule(.{
+        .root_source_file = b.path("src/debug_sq8.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const debug_sq8_exe = b.addExecutable(.{
+        .name = "vdb-debug-sq8",
+        .root_module = debug_sq8_mod,
+    });
+    debug_sq8_mod.addImport("index_ivf_rq", index_mod);
+    debug_sq8_mod.addImport("simd", simd_mod);
+    b.installArtifact(debug_sq8_exe);
+
+    const run_debug_sq8 = b.addRunArtifact(debug_sq8_exe);
+    const debug_sq8_step = b.step("debug-sq8", "Run SQ8 refinement verification");
+    debug_sq8_step.dependOn(&run_debug_sq8.step);
+
     // Run CLI
     const run_cli = b.addRunArtifact(cli);
     if (b.args) |args| {

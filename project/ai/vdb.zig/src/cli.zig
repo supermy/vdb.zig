@@ -8,6 +8,13 @@ fn writeStdout(msg: []const u8) void {
     file.writeStreamingAll(io, msg) catch |err| std.log.err("stdout write failed: {}", .{err});
 }
 
+fn monoMs() i64 {
+    var ts: std.posix.timespec = undefined;
+    const rc = std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts);
+    std.debug.assert(rc == 0);
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+}
+
 /// Command-line interface for vdb.zig (embedded mode).
 /// Commands:
 ///   create-index <dim> <partitions> <output>
@@ -168,19 +175,19 @@ fn runBenchmark(allocator: std.mem.Allocator) !void {
     var rng = std.Random.DefaultPrng.init(123);
     var vec: [128]f32 = undefined;
 
-    const insert_timer = try std.time.Timer.start();
+    const insert_start = monoMs();
     for (0..10000) |_| {
         for (&vec) |*v| {
             v.* = rng.random().float(f32);
         }
         try idx.insert(&vec);
     }
-    const insert_elapsed = insert_timer.read() / std.time.ns_per_ms;
+    const insert_elapsed = monoMs() - insert_start;
     var buf: [256]u8 = undefined;
     const msg1 = try std.fmt.bufPrint(&buf, "Inserted 10000 vectors in {d} ms\n", .{insert_elapsed});
     writeStdout(msg1);
 
-    const search_timer = try std.time.Timer.start();
+    const search_start = monoMs();
     var total_found: u32 = 0;
     for (0..100) |_| {
         for (&vec) |*v| {
@@ -189,7 +196,7 @@ fn runBenchmark(allocator: std.mem.Allocator) !void {
         var results: [10]index_mod.SearchResult = undefined;
         total_found += try idx.search(&vec, 10, 4, &results);
     }
-    const search_elapsed = search_timer.read() / std.time.ns_per_ms;
+    const search_elapsed = monoMs() - search_start;
     const msg2 = try std.fmt.bufPrint(&buf, "100 searches completed in {d} ms, total_found={d}\n", .{ search_elapsed, total_found });
     writeStdout(msg2);
 }

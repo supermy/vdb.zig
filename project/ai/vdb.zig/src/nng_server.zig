@@ -47,11 +47,11 @@ pub fn main() !void {
 
     std.log.info("vdb-nng-server listening on tcp://0.0.0.0:{d}", .{PORT});
 
-    var idx_rwlock = std.Thread.RwLock{};
+    var idx_mutex = std.atomic.Mutex.unlocked;
 
     while (true) {
         const stream = try server.accept(io);
-        const t = std.Thread.spawn(.{}, connectionHandler, .{ allocator, stream, &idx, &idx_rwlock }) catch {
+        const t = std.Thread.spawn(.{}, connectionHandler, .{ allocator, stream, &idx, &idx_mutex }) catch {
             stream.close(io);
             continue;
         };
@@ -63,13 +63,19 @@ fn connectionHandler(
     allocator: std.mem.Allocator,
     stream: std.Io.net.Stream,
     idx: *index_mod.Index,
-    rwlock: *std.Thread.RwLock,
+    mutex: *std.atomic.Mutex,
 ) void {
     // Each thread must use its own Io instance; global_single_threaded is not safe to share across threads.
     const io = std.Io.Threaded.global_single_threaded.io();
-    handleConnection(allocator, io, stream, idx, rwlock) catch |err| {
+    handleConnection(allocator, io, stream, idx, mutex) catch |err| {
         std.log.err("NNG connection error: {}", .{err});
     };
+}
+
+fn spinLock(m: *std.atomic.Mutex) void {
+    while (!m.tryLock()) {
+        std.atomic.spinLoopHint();
+    }
 }
 
 fn handleConnection(
@@ -77,7 +83,7 @@ fn handleConnection(
     io: std.Io,
     stream: std.Io.net.Stream,
     idx: *index_mod.Index,
-    rwlock: *std.Thread.RwLock,
+    mutex: *std.atomic.Mutex,
 ) !void {
     defer stream.close(io);
 
@@ -110,10 +116,10 @@ fn handleConnection(
 
         switch (cmd) {
             0x01 => try handlePing(&writer),
-            0x02 => try handleBinarySearch(allocator, &writer, payload, idx, rwlock),
-            0x03 => try handleBinaryBatchSearch(allocator, &writer, payload, idx, rwlock),
-            0x04 => try handleBinaryInsert(&writer, payload, idx, rwlock),
-            0x05 => try handleBinaryImport(allocator, &writer, payload, idx, rwlock),
+            0x02 => try handleBinarySearch(allocator, &writer, payload, idx, mutex),
+            0x03 => try handleBinaryBatchSearch(allocator, &writer, payload, idx, mutex),
+            0x04 => try handleBinaryInsert(&writer, payload, idx, mutex),
+            0x05 => try handleBinaryImport(allocator, &writer, payload, idx, mutex),
             0x06 => try handleBinaryExport(allocator, &writer, idx),
             else => {
                 try writeError(&writer, .InvalidCommand, "Unknown command");
@@ -135,7 +141,7 @@ fn handleBinarySearch(
     writer: *std.Io.net.Stream.Writer,
     payload: []const u8,
     idx: *index_mod.Index,
-    rwlock: *std.Thread.RwLock,
+    mutex: *std.atomic.Mutex,
 ) !void {
     if (payload.len < 8) {
         try writeError(writer, .MalformedRequest, "Search payload too short");
@@ -154,11 +160,15 @@ fn handleBinarySearch(
         return;
     }
     const raw = payload[8..][0..expected_vec_len];
-    const vec = std.mem.bytesAsSlice(f32, raw);
+    const vec = @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, raw)));
+    if (vec.len != dim) {
+        try writeError(writer, .MalformedRequest, "Vector dimension mismatch");
+        return;
+    }
 
     var results: [256]index_mod.SearchResult = undefined;
-    rwlock.lockShared();
-    defer rwlock.unlockShared();
+    spinLock(mutex);
+    defer mutex.unlock();
     const found = idx.search(vec, k, nprobe, &results) catch {
         try writeError(writer, .MalformedRequest, "Search failed");
         return;
@@ -185,7 +195,7 @@ fn handleBinaryBatchSearch(
     writer: *std.Io.net.Stream.Writer,
     payload: []const u8,
     idx: *index_mod.Index,
-    rwlock: *std.Thread.RwLock,
+    mutex: *std.atomic.Mutex,
 ) !void {
     if (payload.len < 4) {
         try writeError(writer, .MalformedRequest, "Batch payload too short");
@@ -194,31 +204,39 @@ fn handleBinaryBatchSearch(
     const n = std.mem.readInt(u32, payload[0..4], .little);
     var offset: usize = 4;
 
-    var resp_items = std.array_list.Managed(u8).init(allocator);
-    defer resp_items.deinit();
+    var resp_items = std.ArrayList(u8).empty;
+    defer resp_items.deinit(allocator);
 
     for (0..n) |_| {
         if (payload.len - offset < 8) break;
         const k = std.mem.readInt(u32, payload[offset..][0..4], .little);
         const nprobe = std.mem.readInt(u32, payload[offset + 4 ..][0..4], .little);
+        if (k > 256) {
+            try writeError(writer, .PayloadTooLarge, "k exceeds maximum of 256");
+            return;
+        }
         offset += 8;
         const expected_vec_len = idx.dim * @sizeOf(f32);
         if (payload.len - offset < expected_vec_len) break;
         const raw = payload[offset..][0..expected_vec_len];
-        const vec = std.mem.bytesAsSlice(f32, raw);
+        const vec = @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, raw)));
+        if (vec.len != idx.dim) {
+            mutex.unlock();
+            continue;
+        }
         offset += expected_vec_len;
 
         var results: [256]index_mod.SearchResult = undefined;
-        rwlock.lockShared();
+        spinLock(mutex);
         const found = idx.search(vec, k, nprobe, &results) catch {
-            rwlock.unlockShared();
+            mutex.unlock();
             continue;
         };
-        rwlock.unlockShared();
+        mutex.unlock();
 
         var count_buf: [4]u8 = undefined;
         std.mem.writeInt(u32, &count_buf, found, .little);
-        try resp_items.appendSlice(&count_buf);
+        try resp_items.appendSlice(allocator, &count_buf);
         for (0..found) |i| {
             var id_buf: [4]u8 = undefined;
             var pid_buf: [4]u8 = undefined;
@@ -226,9 +244,9 @@ fn handleBinaryBatchSearch(
             std.mem.writeInt(u32, &id_buf, results[i].id, .little);
             std.mem.writeInt(u32, &pid_buf, results[i].partition_id, .little);
             std.mem.writeInt(u32, &score_buf, @bitCast(results[i].score), .little);
-            try resp_items.appendSlice(&id_buf);
-            try resp_items.appendSlice(&pid_buf);
-            try resp_items.appendSlice(&score_buf);
+            try resp_items.appendSlice(allocator, &id_buf);
+            try resp_items.appendSlice(allocator, &pid_buf);
+            try resp_items.appendSlice(allocator, &score_buf);
         }
     }
 
@@ -245,7 +263,7 @@ fn handleBinaryInsert(
     writer: *std.Io.net.Stream.Writer,
     payload: []const u8,
     idx: *index_mod.Index,
-    rwlock: *std.Thread.RwLock,
+    mutex: *std.atomic.Mutex,
 ) !void {
     const expected_vec_len = idx.dim * @sizeOf(f32);
     if (payload.len < expected_vec_len) {
@@ -253,9 +271,9 @@ fn handleBinaryInsert(
         return;
     }
     const raw = payload[0..expected_vec_len];
-    const vec = std.mem.bytesAsSlice(f32, raw);
-    rwlock.lock();
-    defer rwlock.unlock();
+    const vec = @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, raw)));
+    spinLock(mutex);
+    defer mutex.unlock();
     idx.insert(vec) catch {
         try writeError(writer, .MalformedRequest, "Insert failed");
         return;
@@ -271,7 +289,7 @@ fn handleBinaryImport(
     writer: *std.Io.net.Stream.Writer,
     payload: []const u8,
     idx: *index_mod.Index,
-    rwlock: *std.Thread.RwLock,
+    mutex: *std.atomic.Mutex,
 ) !void {
     const parsed = std.json.parseFromSlice(struct {
         vectors: []const []const f32,
@@ -281,8 +299,8 @@ fn handleBinaryImport(
     };
     defer parsed.deinit();
 
-    rwlock.lock();
-    defer rwlock.unlock();
+    spinLock(mutex);
+    defer mutex.unlock();
     // Use batchInsert for better cache locality and pre-assigned partition mapping.
     try idx.batchInsert(parsed.value.vectors);
     const imported = parsed.value.vectors.len;
