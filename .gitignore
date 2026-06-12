@@ -1,0 +1,9 @@
+.zig-cache/
+zig-out/
+*.o
+*.obj
+*.exe
+*.wasm
+.DS_Store
+.trae/
+AGENT.md
